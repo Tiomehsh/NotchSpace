@@ -2,19 +2,41 @@ import AppKit
 import SwiftUI
 
 @MainActor
+private final class DisplayPanelContext {
+    let displayUUID: String
+    var displayID: CGDirectDisplayID
+    var screen: NSScreen
+    let panel: FloatingGlassPanel
+    let hostingView: NSHostingView<SpaceBarView>
+    var previewPlacementOverride: DisplayPlacement?
+
+    init(
+        displayUUID: String,
+        displayID: CGDirectDisplayID,
+        screen: NSScreen,
+        panel: FloatingGlassPanel,
+        hostingView: NSHostingView<SpaceBarView>
+    ) {
+        self.displayUUID = displayUUID
+        self.displayID = displayID
+        self.screen = screen
+        self.panel = panel
+        self.hostingView = hostingView
+    }
+}
+
+@MainActor
 public final class AppCoordinator: NSObject, NSMenuDelegate {
     public let configStore = ConfigStore()
     public let wmClient = WorkspaceManagerClient()
-    public let panel = FloatingGlassPanel()
 
-    private var hostingView: NSHostingView<SpaceBarView>?
+    private var displayContexts: [String: DisplayPanelContext] = [:]
+    private var lastContextMenuDisplayUUID: String?
     private var statusItem: NSStatusItem?
     private var menuBarAppearanceProbe: NSStatusItem?
     private var appAppearanceObservation: NSKeyValueObservation?
     private var menuBarAppearanceObservation: NSKeyValueObservation?
     private var settingsController: SettingsWindowController?
-    private var currentScreen: NSScreen?
-    private var previewPlacementOverride: DisplayPlacement?
 
     public override init() {
         super.init()
@@ -26,7 +48,8 @@ public final class AppCoordinator: NSObject, NSMenuDelegate {
         wmClient.start()
 
         setupAppearanceProbe()
-        setupPanel()
+        syncDisplayPanels()
+        refreshRootViewAndLayout()
         updateMenuBarStatusItem()
         setupSystemObservers()
         observeCapsuleSizeChanges()
@@ -35,7 +58,7 @@ public final class AppCoordinator: NSObject, NSMenuDelegate {
             guard let self else { return }
             self.wmClient.setMode(cfg.interaction.backend)
             self.wmClient.setHideEmptyWorkspaces(cfg.appearance.hideEmptyWorkspaces)
-            self.syncPanelFlags()
+            self.syncAllPanelFlags()
             self.refreshRootViewAndLayout()
             self.updateMenuBarStatusItem()
             self.updateFullscreenVisibility()
@@ -43,70 +66,149 @@ public final class AppCoordinator: NSObject, NSMenuDelegate {
     }
 
     private func resolveTargetScreen() -> NSScreen {
+        if let uuid = lastContextMenuDisplayUUID,
+           let matched = NSScreen.screens.first(where: { NotchGeometryResolver.displayUUID(for: $0) == uuid }) {
+            return matched
+        }
+        let mouseLoc = NSEvent.mouseLocation
+        if let mouseScreen = NSScreen.screens.first(where: { NSMouseInRect(mouseLoc, $0.frame, false) }) {
+            return mouseScreen
+        }
         if let activeDisplayID = wmClient.activeDisplayID,
            let matched = NSScreen.screens.first(where: { NotchGeometryResolver.displayID(for: $0) == activeDisplayID }) {
             return matched
         }
-        if let existing = currentScreen, NSScreen.screens.contains(existing) {
-            return existing
-        }
         return NSScreen.main ?? NSScreen.screens[0]
     }
 
-    private func setupPanel() {
-        let screen = resolveTargetScreen()
-        currentScreen = screen
+    private func syncDisplayPanels() {
+        let screens = NSScreen.screens
+        var activeUUIDs = Set<String>()
 
-        syncPanelFlags()
+        for screen in screens {
+            let uuid = NotchGeometryResolver.displayUUID(for: screen)
+            let displayID = NotchGeometryResolver.displayID(for: screen)
+            activeUUIDs.insert(uuid)
 
-        panel.onSpaceAction = { [weak self] action in
-            self?.wmClient.perform(action)
+            if let existing = displayContexts[uuid] {
+                existing.screen = screen
+                existing.displayID = displayID
+                existing.panel.targetScreen = screen
+                existing.panel.targetDisplayID = displayID
+                syncPanelFlags(for: existing.panel)
+            } else {
+                let panel = FloatingGlassPanel()
+                panel.targetScreen = screen
+                panel.targetDisplayID = displayID
+                syncPanelFlags(for: panel)
+
+                let root = makeSpaceBarView(
+                    for: screen,
+                    displayID: displayID,
+                    panel: panel,
+                    placementOverride: nil
+                )
+                let hosting = NSHostingView(rootView: root)
+                hosting.sizingOptions = []
+                hosting.translatesAutoresizingMaskIntoConstraints = false
+
+                let container = HoverTrackingContainerView(frame: .zero)
+                container.onHoverPointChanged = { [weak panel] pt in
+                    panel?.updateHoverLocation(pt)
+                }
+                container.addSubview(hosting)
+                NSLayoutConstraint.activate([
+                    hosting.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                    hosting.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+                    hosting.topAnchor.constraint(equalTo: container.topAnchor),
+                    hosting.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+                ])
+                panel.contentView = container
+
+                let context = DisplayPanelContext(
+                    displayUUID: uuid,
+                    displayID: displayID,
+                    screen: screen,
+                    panel: panel,
+                    hostingView: hosting
+                )
+                displayContexts[uuid] = context
+
+                panel.onSpaceAction = { [weak self] action in
+                    self?.wmClient.perform(action)
+                }
+
+                panel.onContextMenuRequest = { [weak self] event, view in
+                    guard let self else { return }
+                    self.lastContextMenuDisplayUUID = uuid
+                    let menu = self.buildQuickMenu()
+                    NSMenu.popUpContextMenu(menu, with: event, for: view)
+                }
+
+                panel.onDragPreviewPlacement = { [weak self, weak context] _, placement in
+                    guard let self, let context else { return }
+                    context.previewPlacementOverride = placement
+                    self.updateHostingRootView(for: context)
+                }
+
+                panel.onDragCommitPlacement = { [weak self, weak context] _, placement in
+                    guard let self, let context else { return }
+                    context.previewPlacementOverride = nil
+                    self.configStore.setPlacement(placement, for: context.displayUUID)
+                    self.refreshRootViewAndLayout()
+                }
+
+                panel.onCrossDisplayAppDragUpdate = { [weak self] sourceTarget, screenPt, followWithShift in
+                    guard let self else { return nil }
+                    var matchedHit: (spaceNumber: Int, isNewSpace: Bool)?
+                    for (otherUUID, otherCtx) in self.displayContexts where otherUUID != uuid {
+                        let otherFrame = otherCtx.panel.frame
+                        if otherFrame.insetBy(dx: -16.0, dy: -16.0).contains(screenPt) {
+                            let localX = screenPt.x - otherFrame.minX
+                            let localTopY = otherFrame.height - (screenPt.y - otherFrame.minY)
+                            let topLeft = CGPoint(x: localX, y: localTopY)
+                            let hit = otherCtx.panel.bridge.hitTestDropDestination(
+                                at: topLeft,
+                                excludingSpace: sourceTarget.spaceNumber
+                            )
+                            otherCtx.panel.bridge.activeAppDrag = ActiveAppDrag(
+                                source: sourceTarget,
+                                currentPointInRoot: topLeft,
+                                targetSpaceNumber: hit?.spaceNumber,
+                                isCreatingNewSpace: hit?.isNewSpace ?? false,
+                                followWithShift: followWithShift
+                            )
+                            if let hit {
+                                matchedHit = hit
+                            }
+                        } else if otherCtx.panel.bridge.activeAppDrag != nil {
+                            otherCtx.panel.bridge.activeAppDrag = nil
+                        }
+                    }
+                    return matchedHit
+                }
+
+                panel.onCrossDisplayAppDragEnd = { [weak self] in
+                    guard let self else { return }
+                    for (otherUUID, otherCtx) in self.displayContexts where otherUUID != uuid {
+                        if otherCtx.panel.bridge.activeAppDrag != nil {
+                            otherCtx.panel.bridge.activeAppDrag = nil
+                        }
+                    }
+                }
+
+                repositionPanel(for: context)
+                panel.orderFrontRegardless()
+            }
         }
 
-        panel.onContextMenuRequest = { [weak self] event, view in
-            guard let self else { return }
-            let menu = self.buildQuickMenu()
-            NSMenu.popUpContextMenu(menu, with: event, for: view)
+        let staleUUIDs = Set(displayContexts.keys).subtracting(activeUUIDs)
+        for staleUUID in staleUUIDs {
+            if let removed = displayContexts.removeValue(forKey: staleUUID) {
+                removed.panel.orderOut(nil)
+                removed.panel.close()
+            }
         }
-
-        panel.onDragPreviewPlacement = { [weak self] dragScreen, placement in
-            guard let self else { return }
-            self.currentScreen = dragScreen
-            self.previewPlacementOverride = placement
-            self.updateHostingRootView(for: dragScreen, placementOverride: placement)
-        }
-
-        panel.onDragCommitPlacement = { [weak self] dragScreen, placement in
-            guard let self else { return }
-            self.currentScreen = dragScreen
-            self.previewPlacementOverride = nil
-            let uuid = NotchGeometryResolver.displayUUID(for: dragScreen)
-            self.configStore.setPlacement(placement, for: uuid)
-            self.refreshRootViewAndLayout()
-        }
-
-        let root = makeSpaceBarView(for: screen, placementOverride: nil)
-        let hosting = NSHostingView(rootView: root)
-        hosting.sizingOptions = []
-        hosting.translatesAutoresizingMaskIntoConstraints = false
-
-        let container = HoverTrackingContainerView(frame: .zero)
-        container.onHoverPointChanged = { [weak self] pt in
-            self?.panel.updateHoverLocation(pt)
-        }
-        container.addSubview(hosting)
-        NSLayoutConstraint.activate([
-            hosting.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            hosting.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            hosting.topAnchor.constraint(equalTo: container.topAnchor),
-            hosting.bottomAnchor.constraint(equalTo: container.bottomAnchor)
-        ])
-
-        panel.contentView = container
-        self.hostingView = hosting
-
-        repositionPanel(on: screen)
-        panel.orderFrontRegardless()
     }
 
     private func setupAppearanceProbe() {
@@ -136,7 +238,11 @@ public final class AppCoordinator: NSObject, NSMenuDelegate {
         return appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
     }
 
-    private func resolveColorScheme(for screen: NSScreen, placement: DisplayPlacement) -> ColorScheme {
+    private func resolveColorScheme(
+        for screen: NSScreen,
+        placement: DisplayPlacement,
+        capsuleSize: NSSize
+    ) -> ColorScheme {
         switch configStore.config.appearance.colorTheme {
         case .dark:
             return .dark
@@ -145,13 +251,12 @@ public final class AppCoordinator: NSObject, NSMenuDelegate {
         case .system:
             return isSystemDark() ? .dark : .light
         case .auto:
-            let capSize = panel.bridge.restingCapsuleSize
             let anchorPt = NotchGeometryResolver.resolveCapsuleAnchorPoint(
                 placement: placement,
-                capsuleSize: capSize,
+                capsuleSize: capsuleSize,
                 on: screen
             )
-            let capsuleMidY = anchorPt.topY - capSize.height / 2.0
+            let capsuleMidY = anchorPt.topY - capsuleSize.height / 2.0
             let topBarBoundaryY = screen.frame.maxY - max(NotchGeometryResolver.menuBarHeight(for: screen), 36.0) - 2.0
             let inTopBarZone = capsuleMidY >= topBarBoundaryY
             let dark = inTopBarZone ? isMenuBarDark() : isSystemDark()
@@ -159,7 +264,12 @@ public final class AppCoordinator: NSObject, NSMenuDelegate {
         }
     }
 
-    private func makeSpaceBarView(for screen: NSScreen, placementOverride: DisplayPlacement?) -> SpaceBarView {
+    private func makeSpaceBarView(
+        for screen: NSScreen,
+        displayID: CGDirectDisplayID,
+        panel: FloatingGlassPanel,
+        placementOverride: DisplayPlacement?
+    ) -> SpaceBarView {
         let uuid = NotchGeometryResolver.displayUUID(for: screen)
         let hasNotch = NotchGeometryResolver.hasHardwareNotch(screen)
         let placement = placementOverride ?? configStore.placement(for: uuid, hasNotch: hasNotch)
@@ -167,22 +277,29 @@ public final class AppCoordinator: NSObject, NSMenuDelegate {
             placement: placement,
             dockedShape: configStore.config.appearance.dockedShape
         )
-        let scheme = resolveColorScheme(for: screen, placement: placement)
+        let capSize = currentCapsuleSize(for: displayID, bridge: panel.bridge)
+        let scheme = resolveColorScheme(for: screen, placement: placement, capsuleSize: capSize)
         panel.appearance = NSAppearance(named: scheme == .dark ? .darkAqua : .aqua)
         return SpaceBarView(
             wmClient: wmClient,
             configStore: configStore,
             bridge: panel.bridge,
+            displayID: displayID,
             isDockedChinMode: isChin,
             resolvedColorScheme: scheme
         )
     }
 
-    private func updateHostingRootView(for screen: NSScreen, placementOverride: DisplayPlacement?) {
-        hostingView?.rootView = makeSpaceBarView(for: screen, placementOverride: placementOverride)
+    private func updateHostingRootView(for context: DisplayPanelContext) {
+        context.hostingView.rootView = makeSpaceBarView(
+            for: context.screen,
+            displayID: context.displayID,
+            panel: context.panel,
+            placementOverride: context.previewPlacementOverride
+        )
     }
 
-    private func syncPanelFlags() {
+    private func syncPanelFlags(for panel: FloatingGlassPanel) {
         let cfg = configStore.config
         panel.isPositionLocked = cfg.interaction.lockPosition
         panel.enableScrollSwitch = cfg.interaction.enableScrollSwitch
@@ -190,34 +307,42 @@ public final class AppCoordinator: NSObject, NSMenuDelegate {
         panel.snapThreshold = CGFloat(cfg.interaction.snapThreshold)
     }
 
-    private func refreshRootViewAndLayout() {
-        guard !NSScreen.screens.isEmpty else { return }
-        let screen = resolveTargetScreen()
-        currentScreen = screen
-        updateHostingRootView(for: screen, placementOverride: previewPlacementOverride)
-        if !panel.bridge.isDraggingWindow && panel.bridge.activeAppDrag == nil {
-            repositionPanel(on: screen)
+    private func syncAllPanelFlags() {
+        for context in displayContexts.values {
+            syncPanelFlags(for: context.panel)
         }
     }
 
-    private func currentCapsuleSize() -> NSSize {
+    private func refreshRootViewAndLayout() {
+        syncDisplayPanels()
+        for context in displayContexts.values {
+            updateHostingRootView(for: context)
+            if !context.panel.bridge.isDraggingWindow && context.panel.bridge.activeAppDrag == nil {
+                repositionPanel(for: context)
+            }
+        }
+    }
+
+    private func currentCapsuleSize(for displayID: CGDirectDisplayID, bridge: PanelInteractionBridge) -> NSSize {
         let cfg = configStore.config.appearance
         let scale = CGFloat(min(max(cfg.scale, 0.80), 1.40))
+        let displaySpaces = wmClient.spaces(for: displayID)
         let metrics = SpaceBarView.computeRestingMetrics(
-            spaces: wmClient.spaces,
+            spaces: displaySpaces,
             iconStyle: cfg.iconStyle,
             scale: scale
         )
-        panel.bridge.restingCapsuleSize = metrics.totalSize
+        bridge.restingCapsuleSize = metrics.totalSize
         return metrics.totalSize
     }
 
-    private func repositionPanel(on screen: NSScreen) {
-        let uuid = NotchGeometryResolver.displayUUID(for: screen)
+    private func repositionPanel(for context: DisplayPanelContext) {
+        let screen = context.screen
+        let uuid = context.displayUUID
         let hasNotch = NotchGeometryResolver.hasHardwareNotch(screen)
         let placement = configStore.placement(for: uuid, hasNotch: hasNotch)
 
-        let capsuleSize = currentCapsuleSize()
+        let capsuleSize = currentCapsuleSize(for: context.displayID, bridge: context.panel.bridge)
         let anchorPt = NotchGeometryResolver.resolveCapsuleAnchorPoint(
             placement: placement,
             capsuleSize: capsuleSize,
@@ -229,27 +354,28 @@ public final class AppCoordinator: NSObject, NSMenuDelegate {
             capsuleSize: capsuleSize
         )
 
-        if panel.frame != targetFrame {
-            panel.setFrame(targetFrame, display: true)
+        if context.panel.frame != targetFrame {
+            context.panel.setFrame(targetFrame, display: true)
         }
     }
 
     private func observeCapsuleSizeChanges() {
         withObservationTracking {
             _ = wmClient.spaces
+            _ = wmClient.spacesByDisplayID
             _ = configStore.config.appearance
             _ = wmClient.activeDisplayID
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 try? await Task.sleep(for: .milliseconds(16))
-                if !self.panel.bridge.isDraggingWindow,
-                   self.panel.bridge.activeAppDrag == nil,
-                   !NSScreen.screens.isEmpty {
-                    let screen = self.resolveTargetScreen()
-                    self.currentScreen = screen
-                    self.updateHostingRootView(for: screen, placementOverride: self.previewPlacementOverride)
-                    self.repositionPanel(on: screen)
+                self.syncDisplayPanels()
+                for context in self.displayContexts.values {
+                    if !context.panel.bridge.isDraggingWindow,
+                       context.panel.bridge.activeAppDrag == nil {
+                        self.updateHostingRootView(for: context)
+                        self.repositionPanel(for: context)
+                    }
                 }
                 self.observeCapsuleSizeChanges()
             }
@@ -263,7 +389,10 @@ public final class AppCoordinator: NSObject, NSMenuDelegate {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.refreshRootViewAndLayout()
+                guard let self else { return }
+                self.refreshRootViewAndLayout()
+                self.updateFullscreenVisibility()
+                Task { await self.wmClient.refreshNow() }
             }
         }
 
@@ -294,21 +423,23 @@ public final class AppCoordinator: NSObject, NSMenuDelegate {
     }
 
     private func updateFullscreenVisibility() {
-        guard configStore.config.interaction.hideInFullscreen else {
-            if !panel.isVisible {
-                panel.orderFrontRegardless()
+        let hideInFullscreen = configStore.config.interaction.hideInFullscreen
+        for context in displayContexts.values {
+            guard hideInFullscreen else {
+                if !context.panel.isVisible {
+                    context.panel.orderFrontRegardless()
+                }
+                continue
             }
-            return
-        }
+            let screen = context.screen
+            let inNativeFullscreen = abs(screen.visibleFrame.height - screen.frame.height) < 1.0
+                && !NotchGeometryResolver.hasHardwareNotch(screen)
 
-        let screen = resolveTargetScreen()
-        let inNativeFullscreen = abs(screen.visibleFrame.height - screen.frame.height) < 1.0
-            && !NotchGeometryResolver.hasHardwareNotch(screen)
-
-        if inNativeFullscreen {
-            panel.orderOut(nil)
-        } else {
-            panel.orderFrontRegardless()
+            if inNativeFullscreen {
+                context.panel.orderOut(nil)
+            } else {
+                context.panel.orderFrontRegardless()
+            }
         }
     }
 
@@ -380,6 +511,16 @@ public final class AppCoordinator: NSObject, NSMenuDelegate {
         )
         insideMenuBarItem.target = self
         menu.addItem(insideMenuBarItem)
+
+        if NSScreen.screens.count > 1 {
+            let resetAllItem = NSMenuItem(
+                title: "归位所有显示器位置",
+                action: #selector(resetAllDisplaysPosition),
+                keyEquivalent: ""
+            )
+            resetAllItem.target = self
+            menu.addItem(resetAllItem)
+        }
 
         let lockItem = NSMenuItem(
             title: "锁定位置（按住 ⌥ 仍可拖动）",
@@ -525,6 +666,16 @@ public final class AppCoordinator: NSObject, NSMenuDelegate {
         let uuid = NotchGeometryResolver.displayUUID(for: screen)
         let hasNotch = NotchGeometryResolver.hasHardwareNotch(screen)
         configStore.resetPlacement(for: uuid, hasNotch: hasNotch)
+        lastContextMenuDisplayUUID = nil
+    }
+
+    @objc private func resetAllDisplaysPosition() {
+        for screen in NSScreen.screens {
+            let uuid = NotchGeometryResolver.displayUUID(for: screen)
+            let hasNotch = NotchGeometryResolver.hasHardwareNotch(screen)
+            configStore.resetPlacement(for: uuid, hasNotch: hasNotch)
+        }
+        lastContextMenuDisplayUUID = nil
     }
 
     @objc private func snapInsideMenuBarCenter() {
@@ -534,6 +685,7 @@ public final class AppCoordinator: NSObject, NSMenuDelegate {
             DisplayPlacement(anchor: .menuBarInsideCenter, offsetX: 0, offsetY: 0),
             for: uuid
         )
+        lastContextMenuDisplayUUID = nil
     }
 
     @objc private func toggleLockPosition() {

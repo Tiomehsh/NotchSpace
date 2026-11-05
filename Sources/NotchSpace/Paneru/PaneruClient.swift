@@ -7,7 +7,7 @@ public enum SpaceAction: Sendable {
     case sendFocusedWindow(Int)
     case moveAndFollowWindow(Int)
     case moveSpecificWindow(windowID: Int, fromSpace: Int, toSpace: Int, follow: Bool)
-    case stepRelative(north: Bool)
+    case stepRelative(north: Bool, displayID: UInt32?)
 }
 
 @MainActor
@@ -16,11 +16,17 @@ public final class PaneruClient {
     public private(set) var spaces: [SpaceItemModel] = [
         SpaceItemModel(number: 1, isActive: true, windows: [])
     ]
+    public private(set) var spacesByDisplayID: [UInt32: [SpaceItemModel]] = [:]
     public private(set) var isConnected: Bool = false
     public private(set) var lastRawDocument: PaneruStateDocument?
 
     private let paneruExecutablePath: String
     private var hideEmptyWorkspaces: Bool = false
+
+    @ObservationIgnored
+    private var nativeWorkspaceByDisplayID: [UInt32: Int] = [:]
+    @ObservationIgnored
+    private var activeVirtualByNativeID: [Int: Int] = [:]
 
     @ObservationIgnored
     private var streamTask: Task<Void, Never>?
@@ -39,11 +45,24 @@ public final class PaneruClient {
             ?? "/opt/homebrew/bin/paneru"
     }
 
+    public func spaces(for displayID: UInt32?) -> [SpaceItemModel] {
+        if let displayID, let matched = spacesByDisplayID[displayID], !matched.isEmpty {
+            return matched
+        }
+        return spaces
+    }
+
+    public func nextNewSpaceNumber(for displayID: UInt32?) -> Int? {
+        let currentSpaces = spaces(for: displayID)
+        let maxNum = currentSpaces.map(\.number).max() ?? 1
+        return maxNum < 9 ? (maxNum + 1) : nil
+    }
+
     public func setHideEmptyWorkspaces(_ hide: Bool) {
         guard hideEmptyWorkspaces != hide else { return }
         hideEmptyWorkspaces = hide
         if let doc = lastRawDocument {
-            spaces = PaneruStateProjector.project(document: doc, hideEmptyWorkspaces: hide)
+            projectDocument(doc)
         }
     }
 
@@ -72,6 +91,7 @@ public final class PaneruClient {
 
         switch action {
         case .focusWindow(let winID):
+            optimisticallyFocusWindow(windowID: winID)
             Task.detached(priority: .userInitiated) { [weak self] in
                 _ = PaneruMachIPC.focusWindow(windowID: winID)
                 await self?.scheduleDebouncedRefresh(delayMs: 35)
@@ -121,7 +141,7 @@ public final class PaneruClient {
                 await self?.scheduleDebouncedRefresh(delayMs: 35)
             }
 
-        case .stepRelative(let north):
+        case .stepRelative(let north, _):
             let args = ["send-cmd", "window", "virtualfocus", north ? "north" : "south"]
             Task.detached(priority: .userInitiated) { [weak self] in
                 _ = Self.runCommandSync(executable: execPath, arguments: args)
@@ -144,7 +164,39 @@ public final class PaneruClient {
 
         isConnected = true
         lastRawDocument = doc
+        projectDocument(doc)
+    }
+
+    private func projectDocument(_ doc: PaneruStateDocument) {
+        if let activeDisp = doc.active.display_id, let activeNative = doc.active.native_workspace_id {
+            nativeWorkspaceByDisplayID[activeDisp] = activeNative
+            if let vNum = doc.active.virtual_workspace_number {
+                activeVirtualByNativeID[activeNative] = vNum
+            }
+        }
+
+        for ws in doc.virtual_workspaces {
+            guard let wsNative = ws.native_workspace_id else { continue }
+            if ws.active == true {
+                activeVirtualByNativeID[wsNative] = ws.number
+            }
+            if let winDisp = ws.windows.compactMap(\.display_id).first {
+                nativeWorkspaceByDisplayID[winDisp] = wsNative
+            }
+        }
+
         spaces = PaneruStateProjector.project(document: doc, hideEmptyWorkspaces: hideEmptyWorkspaces)
+
+        var byDisplay: [UInt32: [SpaceItemModel]] = [:]
+        for (dispID, nativeID) in nativeWorkspaceByDisplayID {
+            byDisplay[dispID] = PaneruStateProjector.project(
+                document: doc,
+                targetNativeWorkspaceID: nativeID,
+                activeVirtualOverride: activeVirtualByNativeID[nativeID],
+                hideEmptyWorkspaces: hideEmptyWorkspaces
+            )
+        }
+        spacesByDisplayID = byDisplay
     }
 
     public func scheduleDebouncedRefresh(delayMs: Int = 60) {
@@ -160,6 +212,19 @@ public final class PaneruClient {
         guard spaces.contains(where: { $0.number == workspaceNumber }) else { return }
         for idx in spaces.indices {
             spaces[idx].isActive = (spaces[idx].number == workspaceNumber)
+        }
+    }
+
+    private func optimisticallyFocusWindow(windowID: Int) {
+        for sIdx in spaces.indices {
+            guard let targetWin = spaces[sIdx].windows.first(where: { $0.windowID == windowID }) else { continue }
+            let targetCol = targetWin.columnIndex
+            for wIdx in spaces[sIdx].windows.indices {
+                let isThisWin = spaces[sIdx].windows[wIdx].windowID == windowID
+                let inCol = isThisWin || (targetCol != nil && spaces[sIdx].windows[wIdx].columnIndex == targetCol)
+                spaces[sIdx].windows[wIdx].isFocused = isThisWin
+                spaces[sIdx].windows[wIdx].isInFocusedColumn = inCol
+            }
         }
     }
 
@@ -210,6 +275,10 @@ public final class PaneruClient {
            let targetNum = active.virtual_workspace_number,
            active.native_workspace_id == lastRawDocument?.active.native_workspace_id {
             optimisticallyHighlight(workspaceNumber: targetNum)
+        }
+
+        if let focusedWinID = envelope.active?.focused_window_id {
+            optimisticallyFocusWindow(windowID: focusedWinID)
         }
 
         scheduleDebouncedRefresh(delayMs: 55)

@@ -156,6 +156,7 @@ public struct SpaceBarView: View {
     public let wmClient: WorkspaceManagerClient
     public let configStore: ConfigStore
     public let bridge: PanelInteractionBridge
+    public let displayID: UInt32?
     public let isDockedChinMode: Bool
     public let resolvedColorScheme: ColorScheme
 
@@ -165,12 +166,14 @@ public struct SpaceBarView: View {
         wmClient: WorkspaceManagerClient,
         configStore: ConfigStore,
         bridge: PanelInteractionBridge,
+        displayID: UInt32? = nil,
         isDockedChinMode: Bool,
         resolvedColorScheme: ColorScheme
     ) {
         self.wmClient = wmClient
         self.configStore = configStore
         self.bridge = bridge
+        self.displayID = displayID
         self.isDockedChinMode = isDockedChinMode
         self.resolvedColorScheme = resolvedColorScheme
     }
@@ -184,7 +187,7 @@ public struct SpaceBarView: View {
     }
 
     private var baseItemHeight: CGFloat {
-        round(22.0 * scale)
+        round(22.5 * scale)
     }
 
     private var glassStyleVariant: Glass {
@@ -209,8 +212,8 @@ public struct SpaceBarView: View {
     ) -> (totalSize: CGSize, itemCenterOffsets: [Int: CGFloat]) {
         let s = min(max(scale, 0.80), 1.40)
         let outerH = round(30.0 * s)
-        let itemH = round(22.0 * s)
-        let iconSize = round(15.0 * s)
+        let itemH = round(22.5 * s)
+        let iconSize = round(17.0 * s)
         let itemSpacing = round(3.0 * s)
         let outerHPad = round(5.5 * s)
 
@@ -366,7 +369,7 @@ public struct SpaceBarView: View {
     }
 
     public var body: some View {
-        let spaces = wmClient.spaces
+        let spaces = wmClient.spaces(for: displayID)
         let validSpaceIDs = Set(spaces.map(\.number))
         let validWindowIDs = Set(spaces.flatMap { $0.windows.map(\.windowID) })
         let iconStyle = configStore.config.appearance.iconStyle
@@ -376,11 +379,7 @@ public struct SpaceBarView: View {
 
         let appDrag = bridge.activeAppDrag
         let isDraggingApp = appDrag != nil
-        let maxSpaceNumber = spaces.map(\.number).max() ?? 1
-        let candidateNewSpace: Int? = maxSpaceNumber < 9
-            ? (maxSpaceNumber + 1)
-            : (1...9).first(where: { !validSpaceIDs.contains($0) })
-        let computedNextSpace: Int? = isDraggingApp ? candidateNewSpace : nil
+        let computedNextSpace: Int? = isDraggingApp ? wmClient.nextNewSpaceNumber(for: displayID) : nil
 
         let inHoverOrHandleZone = isHoveringBarOrHandleZone(
             metricsSize: metrics.totalSize,
@@ -979,17 +978,20 @@ private struct WorkspaceIconsClusterView: View {
     let bridge: PanelInteractionBridge
 
     var body: some View {
-        // Enlarges smoothly from 15pt at rest up to 19.5pt on hover (plus pill magnification & direct hover pop!)
-        let iconSize = round((15.0 + 4.5 * hoverProximity) * scale)
+        // Enlarges smoothly from 17pt at rest up to 21.5pt on hover (plus pill magnification & direct hover pop!)
+        let iconSize = round((17.0 + 4.5 * hoverProximity) * scale)
 
         if isActiveSpace {
             let expandedSpacing = round((3.5 + 3.0 * hoverProximity) * scale)
+            let hasFocusedColumn = windows.contains(where: \.isInFocusedColumn)
             HStack(spacing: expandedSpacing) {
                 ForEach(Array(windows.enumerated()), id: \.element.id) { idx, win in
+                    let isHighlightedColumn = !hasFocusedColumn || win.isInFocusedColumn
                     AppWindowIconView(
                         item: win,
                         style: iconStyle,
                         isActiveSpace: true,
+                        isHighlightedColumn: isHighlightedColumn,
                         isStackedDeck: false,
                         isBeingDragged: draggedWindowID == win.windowID,
                         isDirectlyHovered: hoveredWindowID == win.windowID,
@@ -1027,6 +1029,7 @@ private struct WorkspaceIconsClusterView: View {
                             item: win,
                             style: iconStyle,
                             isActiveSpace: false,
+                            isHighlightedColumn: false,
                             isStackedDeck: visibleSlice.count > 1 && hoverProximity < 0.55,
                             isBeingDragged: draggedWindowID == win.windowID,
                             isDirectlyHovered: hoveredWindowID == win.windowID,
@@ -1072,6 +1075,7 @@ private struct AppWindowIconView: View {
     let item: SpaceWindowIconItem
     let style: SpaceIconStyle
     let isActiveSpace: Bool
+    let isHighlightedColumn: Bool
     let isStackedDeck: Bool
     let isBeingDragged: Bool
     let isDirectlyHovered: Bool
@@ -1079,6 +1083,13 @@ private struct AppWindowIconView: View {
 
     var body: some View {
         let image = AppIconCache.shared.icon(bundleID: item.bundleID, appName: item.appName)
+        let isDimmedColumn = isActiveSpace && !isHighlightedColumn && !isDirectlyHovered
+
+        let targetScale: CGFloat = {
+            if isBeingDragged { return 0.80 }
+            if isDirectlyHovered { return 1.16 }
+            return 1.0
+        }()
 
         Group {
             switch style {
@@ -1087,10 +1098,22 @@ private struct AppWindowIconView: View {
                     .resizable()
                     .interpolation(.high)
                     .aspectRatio(contentMode: .fit)
-                    .opacity(isBeingDragged ? 0.24 : (isActiveSpace || isDirectlyHovered ? 1.0 : 0.92))
+                    .saturation(isDimmedColumn ? 0.92 : 1.0)
+                    .brightness(isDimmedColumn ? -0.08 : 0.0)
+                    .opacity(
+                        isBeingDragged
+                            ? 0.24
+                            : (isDirectlyHovered
+                                ? 1.0
+                                : (isActiveSpace ? (isHighlightedColumn ? 1.0 : 0.85) : 0.92))
+                    )
                     .shadow(
-                        color: .black.opacity(isDirectlyHovered ? 0.48 : (isStackedDeck ? 0.42 : 0.26)),
-                        radius: isDirectlyHovered ? 3.2 : (isStackedDeck ? 1.6 : 1.2),
+                        color: .black.opacity(
+                            isDirectlyHovered
+                                ? 0.48
+                                : (isDimmedColumn ? 0.20 : (isStackedDeck ? 0.42 : 0.28))
+                        ),
+                        radius: isDirectlyHovered ? 3.2 : (isStackedDeck ? 1.6 : 1.3),
                         x: isStackedDeck ? -0.6 : 0.0,
                         y: isDirectlyHovered ? 1.2 : 0.5
                     )
@@ -1102,7 +1125,14 @@ private struct AppWindowIconView: View {
                     .aspectRatio(contentMode: .fit)
                     .saturation(0.0)
                     .contrast(1.25)
-                    .opacity(isBeingDragged ? 0.22 : (isActiveSpace || isDirectlyHovered ? 0.98 : 0.78))
+                    .brightness(isDimmedColumn ? -0.06 : 0.0)
+                    .opacity(
+                        isBeingDragged
+                            ? 0.22
+                            : (isDirectlyHovered
+                                ? 0.98
+                                : (isActiveSpace ? (isHighlightedColumn ? 0.98 : 0.83) : 0.78))
+                    )
                     .shadow(
                         color: .black.opacity(isDirectlyHovered ? 0.42 : (isStackedDeck ? 0.35 : 0.18)),
                         radius: isDirectlyHovered ? 2.8 : 1.2,
@@ -1114,8 +1144,9 @@ private struct AppWindowIconView: View {
                 EmptyView()
             }
         }
-        .scaleEffect(isBeingDragged ? 0.80 : (isDirectlyHovered ? 1.16 : 1.0))
+        .scaleEffect(targetScale)
         .offset(y: (!isBeingDragged && isDirectlyHovered) ? -1.4 : 0.0)
+        .animation(.interactiveSpring(response: 0.20, dampingFraction: 0.72), value: isHighlightedColumn)
         .animation(.interactiveSpring(response: 0.18, dampingFraction: 0.68), value: isDirectlyHovered)
         .animation(.easeOut(duration: 0.14), value: isBeingDragged)
         .frame(width: size, height: size)

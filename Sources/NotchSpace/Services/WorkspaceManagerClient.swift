@@ -44,6 +44,33 @@ public final class WorkspaceManagerClient {
         }
     }
 
+    public var spacesByDisplayID: [UInt32: [SpaceItemModel]] {
+        switch activeBackend {
+        case .omniwm:
+            return omniwmClient.spacesByDisplayID
+        case .paneru:
+            return paneruClient.spacesByDisplayID
+        }
+    }
+
+    public func spaces(for displayID: UInt32?) -> [SpaceItemModel] {
+        switch activeBackend {
+        case .omniwm:
+            return omniwmClient.spaces(for: displayID)
+        case .paneru:
+            return paneruClient.spaces(for: displayID)
+        }
+    }
+
+    public func nextNewSpaceNumber(for displayID: UInt32?) -> Int? {
+        switch activeBackend {
+        case .omniwm:
+            return omniwmClient.nextNewSpaceNumber(for: displayID)
+        case .paneru:
+            return paneruClient.nextNewSpaceNumber(for: displayID)
+        }
+    }
+
     public var isConnected: Bool {
         switch activeBackend {
         case .omniwm:

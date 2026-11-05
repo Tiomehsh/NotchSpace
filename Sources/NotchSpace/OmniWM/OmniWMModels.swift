@@ -231,6 +231,7 @@ public enum OmniWMStateProjector {
         windows: [OmniWMWindow],
         activeDisplayRefID: String?,
         activeWorkspaceNumber: Int?,
+        focusedOpaqueWindowID: String? = nil,
         hideEmptyWorkspaces: Bool
     ) -> [SpaceItemModel] {
         let displayWorkspaces = workspaces
@@ -257,19 +258,22 @@ public enum OmniWMStateProjector {
         let resolvedActiveNum: Int = activeWorkspaceNumber
             ?? displayWorkspaces.first(where: { $0.isFocused == true })?.resolvedNumber
             ?? displayWorkspaces.first(where: { $0.isCurrent == true })?.resolvedNumber
+            ?? displayWorkspaces.first(where: { $0.isVisible == true })?.resolvedNumber
+            ?? displayWorkspaces.first?.resolvedNumber
             ?? 1
 
         let highestOccupied = windowsBySpace
             .filter { !$0.value.isEmpty }
             .keys
-            .max() ?? 1
+            .max() ?? (displayWorkspaces.first?.resolvedNumber ?? 1)
         let maxVisibleWhenNotHidingEmpty = max(resolvedActiveNum, highestOccupied)
 
         var candidateNumbers: [Int] = displayWorkspaces.compactMap(\.resolvedNumber)
         for occupiedKey in windowsBySpace.keys where !candidateNumbers.contains(occupiedKey) {
             candidateNumbers.append(occupiedKey)
         }
-        if !candidateNumbers.contains(resolvedActiveNum) {
+        if !candidateNumbers.contains(resolvedActiveNum),
+           (displayWorkspaces.isEmpty || displayWorkspaces.contains(where: { $0.resolvedNumber == resolvedActiveNum })) {
             candidateNumbers.append(resolvedActiveNum)
         }
         candidateNumbers.sort()
@@ -280,7 +284,11 @@ public enum OmniWMStateProjector {
         for num in candidateNumbers {
             let isActive = (num == resolvedActiveNum)
             let rawWins = windowsBySpace[num] ?? []
-            let items = orderedWindows(in: rawWins)
+            let wsFocusedOpaqueID = displayWorkspaces.first(where: { $0.resolvedNumber == num })?.focusedWindowId
+            let preferredFocusedOpaqueID = isActive
+                ? (focusedOpaqueWindowID ?? wsFocusedOpaqueID)
+                : wsFocusedOpaqueID
+            let items = orderedWindows(in: rawWins, preferredFocusedOpaqueID: preferredFocusedOpaqueID)
 
             if hideEmptyWorkspaces {
                 if items.isEmpty && !isActive {
@@ -308,7 +316,10 @@ public enum OmniWMStateProjector {
         return result
     }
 
-    private static func orderedWindows(in rawWindows: [OmniWMWindow]) -> [SpaceWindowIconItem] {
+    private static func orderedWindows(
+        in rawWindows: [OmniWMWindow],
+        preferredFocusedOpaqueID: String?
+    ) -> [SpaceWindowIconItem] {
         guard !rawWindows.isEmpty else { return [] }
 
         // Swift's `.sorted(by:)` is guaranteed stable, preserving OmniWM's top-to-bottom column row order
@@ -320,12 +331,27 @@ public enum OmniWMStateProjector {
             return false
         }
 
+        let focusedWin: OmniWMWindow? = {
+            if let preferredFocusedOpaqueID,
+               let match = ordered.first(where: { $0.id == preferredFocusedOpaqueID }) {
+                return match
+            }
+            return ordered.first(where: { $0.isFocused == true })
+        }()
+        let focusedCol = focusedWin?.columnIndex
+
         return ordered.map { win in
-            SpaceWindowIconItem(
+            let isWinFocused = (focusedWin != nil)
+                ? (win.id == focusedWin?.id)
+                : (win.isFocused ?? false)
+            let inFocusedCol = isWinFocused || (focusedCol != nil && win.columnIndex == focusedCol)
+            return SpaceWindowIconItem(
                 windowID: win.resolvedWindowID,
                 bundleID: win.app?.bundleId ?? "",
                 appName: win.app?.name ?? "",
-                isFocused: win.isFocused ?? false
+                isFocused: isWinFocused,
+                isInFocusedColumn: inFocusedCol,
+                columnIndex: win.columnIndex
             )
         }
     }

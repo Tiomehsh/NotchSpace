@@ -47,9 +47,18 @@ private struct SettingsContentView: View {
     let activeScreenProvider: () -> NSScreen
 
     @State private var launchAtLogin: Bool = LaunchAgentManager.isEnabled
+    @State private var selectedDisplayUUID: String?
+
+    private var availableScreens: [NSScreen] {
+        NSScreen.screens
+    }
 
     private var currentScreen: NSScreen {
-        activeScreenProvider()
+        if let selectedDisplayUUID,
+           let matched = availableScreens.first(where: { NotchGeometryResolver.displayUUID(for: $0) == selectedDisplayUUID }) {
+            return matched
+        }
+        return activeScreenProvider()
     }
 
     private var displayUUID: String {
@@ -66,7 +75,22 @@ private struct SettingsContentView: View {
 
     var body: some View {
         Form {
-            Section("位置与拖拽自定义（当前显示器）") {
+            Section("位置与拖拽自定义（各显示器独立记忆）") {
+                if availableScreens.count > 1 {
+                    Picker(
+                        "目标显示器",
+                        selection: Binding(
+                            get: { displayUUID },
+                            set: { newUUID in selectedDisplayUUID = newUUID }
+                        )
+                    ) {
+                        ForEach(availableScreens, id: \.self) { scr in
+                            let uuid = NotchGeometryResolver.displayUUID(for: scr)
+                            let notchTag = NotchGeometryResolver.hasHardwareNotch(scr) ? "（刘海屏）" : ""
+                            Text("\(scr.localizedName)\(notchTag)").tag(uuid)
+                        }
+                    }
+                }
                 Picker(
                     "对齐基准点",
                     selection: Binding(

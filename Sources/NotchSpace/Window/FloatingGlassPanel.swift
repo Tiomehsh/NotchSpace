@@ -66,11 +66,15 @@ public final class FloatingGlassPanel: NSPanel {
     public var onContextMenuRequest: ((NSEvent, NSView) -> Void)?
     public var onDragPreviewPlacement: ((NSScreen, DisplayPlacement) -> Void)?
     public var onDragCommitPlacement: ((NSScreen, DisplayPlacement) -> Void)?
+    public var onCrossDisplayAppDragUpdate: ((WindowIconTarget, NSPoint, Bool) -> (spaceNumber: Int, isNewSpace: Bool)?)?
+    public var onCrossDisplayAppDragEnd: (() -> Void)?
 
     public var isPositionLocked: Bool = false
     public var enableScrollSwitch: Bool = false
     public var dockedShape: DockedCapsuleShape = .floatingCapsule
     public var snapThreshold: CGFloat = 8.0
+    public weak var targetScreen: NSScreen?
+    public var targetDisplayID: UInt32?
 
     private var pointerSession: PointerSession = .idle
     private var mouseDownScreenPoint: NSPoint?
@@ -240,7 +244,8 @@ public final class FloatingGlassPanel: NSPanel {
             proposedPanelOrigin: proposedOrigin,
             capsuleSize: bridge.restingCapsuleSize,
             dockedShape: dockedShape,
-            snapThreshold: snapThreshold
+            snapThreshold: snapThreshold,
+            preferredScreen: targetScreen
         )
 
         if evaluation.snapKind != .none && evaluation.snapKind != lastSnapKind {
@@ -254,7 +259,16 @@ public final class FloatingGlassPanel: NSPanel {
 
     private func updateAppDragStep(sourceTarget: WindowIconTarget, event: NSEvent) {
         let currentPt = rootTopLeftPoint(for: event)
-        let dropHit = bridge.hitTestDropDestination(at: currentPt, excludingSpace: sourceTarget.spaceNumber)
+        let followWithShift = event.modifierFlags.contains(.shift)
+        let localHit = bridge.hitTestDropDestination(at: currentPt, excludingSpace: sourceTarget.spaceNumber)
+        let remoteHit: (spaceNumber: Int, isNewSpace: Bool)?
+        if localHit != nil {
+            onCrossDisplayAppDragEnd?()
+            remoteHit = nil
+        } else {
+            remoteHit = onCrossDisplayAppDragUpdate?(sourceTarget, NSEvent.mouseLocation, followWithShift)
+        }
+        let dropHit = localHit ?? remoteHit
 
         if dropHit?.spaceNumber != lastHoveredDropSpace {
             if dropHit != nil {
@@ -268,7 +282,7 @@ public final class FloatingGlassPanel: NSPanel {
             currentPointInRoot: currentPt,
             targetSpaceNumber: dropHit?.spaceNumber,
             isCreatingNewSpace: dropHit?.isNewSpace ?? false,
-            followWithShift: event.modifierFlags.contains(.shift)
+            followWithShift: followWithShift
         )
     }
 
@@ -293,7 +307,8 @@ public final class FloatingGlassPanel: NSPanel {
                 proposedPanelOrigin: frame.origin,
                 capsuleSize: bridge.restingCapsuleSize,
                 dockedShape: dockedShape,
-                snapThreshold: snapThreshold
+                snapThreshold: snapThreshold,
+                preferredScreen: targetScreen
             )
             setFrameOrigin(evaluation.snappedPanelOrigin)
             onDragCommitPlacement?(evaluation.screen, evaluation.placement)
@@ -302,19 +317,24 @@ public final class FloatingGlassPanel: NSPanel {
             restoreHoverCursor(at: insidePostSnap ? postSnapPt : nil)
 
         case .draggingApp(let sourceTarget):
-            let finalDrop = bridge.hitTestDropDestination(at: upPt, excludingSpace: sourceTarget.spaceNumber)
+            let followWithShift = event.modifierFlags.contains(.shift)
+            let localDrop = bridge.hitTestDropDestination(at: upPt, excludingSpace: sourceTarget.spaceNumber)
+            let remoteDrop = localDrop == nil
+                ? onCrossDisplayAppDragUpdate?(sourceTarget, NSEvent.mouseLocation, followWithShift)
+                : nil
+            let finalDrop = localDrop ?? remoteDrop
+            onCrossDisplayAppDragEnd?()
             bridge.activeAppDrag = nil
             restoreHoverCursor(at: isInsideBounds ? upPt : nil)
 
             if let dst = finalDrop {
-                let shouldFollow = event.modifierFlags.contains(.shift)
                 NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
                 onSpaceAction?(
                     .moveSpecificWindow(
                         windowID: sourceTarget.windowID,
                         fromSpace: sourceTarget.spaceNumber,
                         toSpace: dst.spaceNumber,
-                        follow: shouldFollow
+                        follow: followWithShift
                     )
                 )
             }
@@ -398,6 +418,6 @@ public final class FloatingGlassPanel: NSPanel {
         guard abs(delta) > 3.0 else { return }
 
         lastScrollTriggerTime = now
-        onSpaceAction?(.stepRelative(north: delta > 0))
+        onSpaceAction?(.stepRelative(north: delta > 0, displayID: targetDisplayID))
     }
 }

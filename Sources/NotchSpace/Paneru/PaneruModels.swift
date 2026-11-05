@@ -33,6 +33,7 @@ public struct PaneruWindowFrame: Codable, Equatable, Sendable {
 
 public struct PaneruWindow: Codable, Sendable {
     public let window_id: Int
+    public let display_id: UInt32?
     public let bundle_id: String?
     public let app_name: String?
     public let title: String?
@@ -56,7 +57,25 @@ public struct SpaceWindowIconItem: Identifiable, Equatable, Sendable {
     public let windowID: Int
     public let bundleID: String
     public let appName: String
-    public let isFocused: Bool
+    public var isFocused: Bool
+    public var isInFocusedColumn: Bool
+    public let columnIndex: Int?
+
+    public init(
+        windowID: Int,
+        bundleID: String,
+        appName: String,
+        isFocused: Bool,
+        isInFocusedColumn: Bool? = nil,
+        columnIndex: Int? = nil
+    ) {
+        self.windowID = windowID
+        self.bundleID = bundleID
+        self.appName = appName
+        self.isFocused = isFocused
+        self.isInFocusedColumn = isInFocusedColumn ?? isFocused
+        self.columnIndex = columnIndex
+    }
 }
 
 public struct SpaceItemModel: Identifiable, Equatable, Sendable {
@@ -73,10 +92,14 @@ public enum PaneruStateProjector {
     /// Active workspace displays windows expanded left-to-right; inactive workspaces stack them compactly.
     public static func project(
         document: PaneruStateDocument,
+        targetNativeWorkspaceID: Int? = nil,
+        activeVirtualOverride: Int? = nil,
         hideEmptyWorkspaces: Bool
     ) -> [SpaceItemModel] {
-        let activeNative = document.active.native_workspace_id
-        let activeVirtual = document.active.virtual_workspace_number
+        let activeNative = targetNativeWorkspaceID ?? document.active.native_workspace_id
+        let isTargetingActiveNative = (activeNative == document.active.native_workspace_id)
+        let activeVirtual = activeVirtualOverride
+            ?? (isTargetingActiveNative ? document.active.virtual_workspace_number : nil)
 
         let filteredWorkspaces = document.virtual_workspaces
             .filter { ws in
@@ -90,7 +113,11 @@ public enum PaneruStateProjector {
 
         for ws in filteredWorkspaces {
             let isActive = (ws.number == activeVirtual) || (ws.active == true && activeVirtual == nil)
-            let items = orderedWindows(in: ws.windows, isWorkspaceActive: isActive)
+            let items = orderedWindows(
+                in: ws.windows,
+                isWorkspaceActive: isActive,
+                activeFocusedWindowID: (isActive && isTargetingActiveNative) ? document.active.focused_window_id : nil
+            )
 
             if hideEmptyWorkspaces && items.isEmpty && !isActive {
                 continue
@@ -114,7 +141,8 @@ public enum PaneruStateProjector {
 
     private static func orderedWindows(
         in rawWindows: [PaneruWindow],
-        isWorkspaceActive: Bool
+        isWorkspaceActive: Bool,
+        activeFocusedWindowID: Int?
     ) -> [SpaceWindowIconItem] {
         let tiled = rawWindows.filter { !($0.floating ?? false) }
         guard !tiled.isEmpty else { return [] }
@@ -142,12 +170,42 @@ public enum PaneruStateProjector {
             ordered = tiled
         }
 
-        return ordered.map { win in
-            SpaceWindowIconItem(
+        // Resolve column indices (explicit `column` if provided by Paneru, or grouped by `frame.x` on active space)
+        var resolvedColumns: [Int] = []
+        resolvedColumns.reserveCapacity(ordered.count)
+        var currentSyntheticCol = 1
+        var lastX: Double?
+
+        for (idx, win) in ordered.enumerated() {
+            if let explicitCol = win.column {
+                resolvedColumns.append(explicitCol)
+            } else if isWorkspaceActive, let wx = win.frame?.x {
+                if let prevX = lastX, abs(wx - prevX) > 8.0 {
+                    currentSyntheticCol += 1
+                }
+                lastX = wx
+                resolvedColumns.append(currentSyntheticCol)
+            } else {
+                resolvedColumns.append(idx + 1)
+            }
+        }
+
+        let focusedIdx = ordered.firstIndex { win in
+            (win.focused == true) || (activeFocusedWindowID != nil && win.window_id == activeFocusedWindowID)
+        }
+        let focusedCol: Int? = focusedIdx.map { resolvedColumns[$0] }
+
+        return ordered.enumerated().map { idx, win in
+            let colIdx = resolvedColumns[idx]
+            let isWinFocused = (idx == focusedIdx) || (focusedIdx == nil && (win.focused ?? false))
+            let inFocusedCol = isWinFocused || (focusedCol != nil && colIdx == focusedCol)
+            return SpaceWindowIconItem(
                 windowID: win.window_id,
                 bundleID: win.bundle_id ?? "",
                 appName: win.app_name ?? "",
-                isFocused: win.focused ?? false
+                isFocused: isWinFocused,
+                isInFocusedColumn: inFocusedCol,
+                columnIndex: colIdx
             )
         }
     }

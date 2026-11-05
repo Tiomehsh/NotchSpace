@@ -184,7 +184,8 @@ public enum NotchGeometryResolver {
         proposedPanelOrigin: NSPoint,
         capsuleSize: NSSize,
         dockedShape: DockedCapsuleShape,
-        snapThreshold: CGFloat
+        snapThreshold: CGFloat,
+        preferredScreen: NSScreen? = nil
     ) -> (screen: NSScreen, placement: DisplayPlacement, snappedPanelOrigin: NSPoint, snapKind: DragSnapKind) {
         let mx = panelHorizontalMargin
         let my = panelVerticalMargin
@@ -192,9 +193,14 @@ public enum NotchGeometryResolver {
         let capsuleTopY = proposedPanelOrigin.y + my + capsuleSize.height
 
         let centerPoint = NSPoint(x: capsuleCenterX, y: capsuleTopY - capsuleSize.height / 2.0)
-        let screen = NSScreen.screens.first(where: { NSMouseInRect(centerPoint, $0.frame, false) })
-            ?? NSScreen.main
-            ?? NSScreen.screens[0]
+        let screen: NSScreen = {
+            if let preferredScreen, NSScreen.screens.contains(preferredScreen) {
+                return preferredScreen
+            }
+            return NSScreen.screens.first(where: { NSMouseInRect(centerPoint, $0.frame, false) })
+                ?? NSScreen.main
+                ?? NSScreen.screens[0]
+        }()
 
         let notch = notchRect(for: screen)
         let hasNotch = notch != nil
