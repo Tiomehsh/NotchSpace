@@ -1,0 +1,154 @@
+import Foundation
+
+public struct PaneruStateDocument: Codable, Sendable {
+    public let version: Int?
+    public let timestamp: Int?
+    public let active: PaneruActiveState
+    public let virtual_workspaces: [PaneruVirtualWorkspace]
+}
+
+public struct PaneruActiveState: Codable, Equatable, Sendable {
+    public let display_id: UInt32?
+    public let native_workspace_id: Int?
+    public let virtual_workspace_number: Int?
+    public let focused_window_id: Int?
+    public let focused_bundle_id: String?
+    public let focused_app_name: String?
+    public let focused_window_title: String?
+}
+
+public struct PaneruVirtualWorkspace: Codable, Sendable {
+    public let number: Int
+    public let native_workspace_id: Int?
+    public let active: Bool?
+    public let windows: [PaneruWindow]
+}
+
+public struct PaneruWindowFrame: Codable, Equatable, Sendable {
+    public let x: Double
+    public let y: Double
+    public let width: Double
+    public let height: Double
+}
+
+public struct PaneruWindow: Codable, Sendable {
+    public let window_id: Int
+    public let bundle_id: String?
+    public let app_name: String?
+    public let title: String?
+    public let focused: Bool?
+    public let floating: Bool?
+    public let column: Int?
+    public let row: Int?
+    public let frame: PaneruWindowFrame?
+}
+
+public struct PaneruSubscribeEvent: Codable, Sendable {
+    public let event: String
+    public let virtual_workspace_number: Int?
+    public let active: PaneruActiveState?
+}
+
+// MARK: - View Presentation Models
+
+public struct SpaceWindowIconItem: Identifiable, Equatable, Sendable {
+    public var id: Int { windowID }
+    public let windowID: Int
+    public let bundleID: String
+    public let appName: String
+    public let isFocused: Bool
+}
+
+public struct SpaceItemModel: Identifiable, Equatable, Sendable {
+    public var id: Int { number }
+    public let number: Int
+    public var isActive: Bool
+    public let windows: [SpaceWindowIconItem]
+
+    public var isEmpty: Bool { windows.isEmpty }
+}
+
+public enum PaneruStateProjector {
+    /// Projects raw Paneru JSON state into ordered workspace items preserving all managed windows.
+    /// Active workspace displays windows expanded left-to-right; inactive workspaces stack them compactly.
+    public static func project(
+        document: PaneruStateDocument,
+        hideEmptyWorkspaces: Bool
+    ) -> [SpaceItemModel] {
+        let activeNative = document.active.native_workspace_id
+        let activeVirtual = document.active.virtual_workspace_number
+
+        let filteredWorkspaces = document.virtual_workspaces
+            .filter { ws in
+                guard let activeNative, let wsNative = ws.native_workspace_id else { return true }
+                return wsNative == activeNative
+            }
+            .sorted { $0.number < $1.number }
+
+        var result: [SpaceItemModel] = []
+        result.reserveCapacity(filteredWorkspaces.count)
+
+        for ws in filteredWorkspaces {
+            let isActive = (ws.number == activeVirtual) || (ws.active == true && activeVirtual == nil)
+            let items = orderedWindows(in: ws.windows, isWorkspaceActive: isActive)
+
+            if hideEmptyWorkspaces && items.isEmpty && !isActive {
+                continue
+            }
+
+            result.append(
+                SpaceItemModel(
+                    number: ws.number,
+                    isActive: isActive,
+                    windows: items
+                )
+            )
+        }
+
+        if result.isEmpty {
+            result.append(SpaceItemModel(number: activeVirtual ?? 1, isActive: true, windows: []))
+        }
+
+        return result
+    }
+
+    private static func orderedWindows(
+        in rawWindows: [PaneruWindow],
+        isWorkspaceActive: Bool
+    ) -> [SpaceWindowIconItem] {
+        let tiled = rawWindows.filter { !($0.floating ?? false) }
+        guard !tiled.isEmpty else { return [] }
+
+        let ordered: [PaneruWindow]
+        if tiled.allSatisfy({ $0.column != nil }) {
+            ordered = tiled.sorted { lhs, rhs in
+                let lc = lhs.column ?? 0
+                let rc = rhs.column ?? 0
+                if lc != rc { return lc < rc }
+                return (lhs.row ?? 0) < (rhs.row ?? 0)
+            }
+        } else if isWorkspaceActive {
+            // On the active workspace, window frames reflect true on-screen column coordinates.
+            ordered = tiled.sorted { lhs, rhs in
+                let lx = lhs.frame?.x ?? 0
+                let rx = rhs.frame?.x ?? 0
+                if abs(lx - rx) > 8.0 { return lx < rx }
+                return (lhs.frame?.y ?? 0) < (rhs.frame?.y ?? 0)
+            }
+        } else {
+            // On inactive workspaces, Paneru parks all windows in a sliver at the screen corner
+            // (so frame.x values are nearly identical). Preserve Paneru's strip order directly
+            // so every window in the workspace is retained for stacked rendering.
+            ordered = tiled
+        }
+
+        return ordered.map { win in
+            SpaceWindowIconItem(
+                windowID: win.window_id,
+                bundleID: win.bundle_id ?? "",
+                appName: win.app_name ?? "",
+                isFocused: win.focused ?? false
+            )
+        }
+    }
+}
