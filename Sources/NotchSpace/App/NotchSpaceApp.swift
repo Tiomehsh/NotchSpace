@@ -9,7 +9,7 @@ final class NotchSpaceAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        coordinator.paneruClient.stop()
+        coordinator.wmClient.stop()
     }
 }
 

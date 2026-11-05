@@ -2,11 +2,19 @@ import AppKit
 import CoreGraphics
 import Foundation
 
+public enum DragSnapKind: Equatable, Sendable {
+    case none
+    case notchBottomCenter
+    case statusBarInsideVertical
+    case statusBarBelowVertical
+}
+
 public enum NotchGeometryResolver {
-    /// Generous transparent canvas margins around the resting capsule so Dock-style fluid hover magnification
-    /// and Liquid Glass shadows animate at 120fps purely inside SwiftUI without resizing the NSPanel.
-    public static let panelHorizontalMargin: CGFloat = 38.0
-    public static let panelVerticalMargin: CGFloat = 16.0
+    /// Generous transparent canvas margins around the resting capsule so Dock-style fluid hover magnification,
+    /// the right-side dynamic drag handle, New Space (`+`) drop target, and dragged App glass badges animate
+    /// at 120fps purely inside SwiftUI without resizing the NSPanel.
+    public static let panelHorizontalMargin: CGFloat = 76.0
+    public static let panelVerticalMargin: CGFloat = 28.0
 
     public static func displayID(for screen: NSScreen) -> CGDirectDisplayID {
         (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID)
@@ -54,6 +62,58 @@ public enum NotchGeometryResolver {
         return NSStatusBar.system.thickness
     }
 
+    /// Returns the visual height of the top bar corridor (from `screen.frame.maxY` down to the top edge
+    /// of tiled windows just below the menu bar, or `menuBarHeight + 3pt` when no window sits near the bar),
+    /// so snapping inside the status bar centers the capsule with equal top & bottom breathing room.
+    public static func statusBarVisualCorridorHeight(for screen: NSScreen) -> CGFloat {
+        let mbHeight = menuBarHeight(for: screen)
+        guard let primaryScreenHeight = NSScreen.screens.first?.frame.height else {
+            return mbHeight + 3.0
+        }
+        // Convert `screen.frame.maxY` (AppKit bottom-left origin) into CoreGraphics global Y (primary top-left origin)
+        let screenTopCGY = primaryScreenHeight - screen.frame.maxY
+
+        let opts = CGWindowListOption(arrayLiteral: .optionOnScreenOnly, .excludeDesktopElements)
+        if let infoList = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] {
+            var nearestWindowOffset: CGFloat?
+            for info in infoList {
+                guard (info[kCGWindowLayer as String] as? Int) == 0,
+                      let boundsDict = info[kCGWindowBounds as String] as? NSDictionary else {
+                    continue
+                }
+                var cgRect = CGRect.zero
+                guard CGRectMakeWithDictionaryRepresentation(boundsDict, &cgRect),
+                      cgRect.width >= 200,
+                      cgRect.height >= 120 else {
+                    continue
+                }
+                // Check horizontal overlap with this screen
+                let overlapX = min(cgRect.maxX, screen.frame.maxX) - max(cgRect.minX, screen.frame.minX)
+                guard overlapX > 80 else { continue }
+
+                let offsetFromScreenTop = cgRect.minY - screenTopCGY
+                if offsetFromScreenTop >= mbHeight - 1.0 && offsetFromScreenTop <= mbHeight + 16.0 {
+                    if let cur = nearestWindowOffset {
+                        nearestWindowOffset = min(cur, offsetFromScreenTop)
+                    } else {
+                        nearestWindowOffset = offsetFromScreenTop
+                    }
+                }
+            }
+            if let nearestWindowOffset {
+                return nearestWindowOffset
+            }
+        }
+        return mbHeight + 3.0
+    }
+
+    /// Top Y (in AppKit screen coordinates) that vertically centers `capsuleSize` inside the status bar corridor.
+    public static func statusBarInsideCenteredTopY(capsuleSize: NSSize, on screen: NSScreen) -> CGFloat {
+        let corridorHeight = statusBarVisualCorridorHeight(for: screen)
+        let topMargin = max(2.0, round((corridorHeight - capsuleSize.height) / 2.0 * 2.0) / 2.0)
+        return screen.frame.maxY - topMargin
+    }
+
     /// Computes `(centerX, topY)` of the resting visible capsule in global AppKit coordinates.
     public static func resolveCapsuleAnchorPoint(
         placement: DisplayPlacement,
@@ -77,7 +137,7 @@ public enum NotchGeometryResolver {
             }
 
         case .menuBarInsideCenter:
-            let verticalCenterTop = frame.maxY - max(1, (mbHeight - capsuleSize.height) / 2.0)
+            let verticalCenterTop = statusBarInsideCenteredTopY(capsuleSize: capsuleSize, on: screen)
             rawCenterX = frame.midX + CGFloat(placement.offsetX)
             rawTopY = verticalCenterTop - CGFloat(placement.offsetY)
 
@@ -125,7 +185,7 @@ public enum NotchGeometryResolver {
         capsuleSize: NSSize,
         dockedShape: DockedCapsuleShape,
         snapThreshold: CGFloat
-    ) -> (screen: NSScreen, placement: DisplayPlacement, snappedPanelOrigin: NSPoint, didSnap: Bool) {
+    ) -> (screen: NSScreen, placement: DisplayPlacement, snappedPanelOrigin: NSPoint, snapKind: DragSnapKind) {
         let mx = panelHorizontalMargin
         let my = panelVerticalMargin
         let capsuleCenterX = proposedPanelOrigin.x + mx + capsuleSize.width / 2.0
@@ -136,56 +196,82 @@ public enum NotchGeometryResolver {
             ?? NSScreen.main
             ?? NSScreen.screens[0]
 
-        let hasNotch = hasHardwareNotch(screen)
+        let notch = notchRect(for: screen)
+        let hasNotch = notch != nil
         let mbHeight = menuBarHeight(for: screen)
+        let statusBarBottomY = notch?.minY ?? (screen.frame.maxY - mbHeight)
         let defaultBottomGap: Double = (dockedShape == .notchChin && hasNotch) ? 0.0 : 4.0
 
-        let bottomTargetX = notchRect(for: screen)?.midX ?? screen.frame.midX
-        let bottomTargetTopY = (notchRect(for: screen)?.minY ?? (screen.frame.maxY - mbHeight)) - CGFloat(defaultBottomGap)
+        let clampedCenterX = min(
+            max(capsuleCenterX, screen.frame.minX + capsuleSize.width / 2.0 + 4.0),
+            screen.frame.maxX - capsuleSize.width / 2.0 - 4.0
+        )
 
-        if abs(capsuleCenterX - bottomTargetX) <= snapThreshold,
-           abs(capsuleTopY - bottomTargetTopY) <= snapThreshold {
-            let placement = DisplayPlacement(
-                anchor: .notchOrMenuBarBottomCenter,
-                offsetX: 0.0,
-                offsetY: defaultBottomGap
-            )
-            let frame = panelFrame(
-                capsuleCenterX: bottomTargetX,
-                capsuleTopY: bottomTargetTopY,
-                capsuleSize: capsuleSize
-            )
-            return (screen, placement, frame.origin, true)
-        }
+        let belowStatusBarTopY = statusBarBottomY - CGFloat(defaultBottomGap)
+        let insideStatusBarTopY = statusBarInsideCenteredTopY(capsuleSize: capsuleSize, on: screen)
 
-        if !hasNotch {
-            let insideTopY = screen.frame.maxY - max(1, (mbHeight - capsuleSize.height) / 2.0)
-            if abs(capsuleCenterX - screen.frame.midX) <= snapThreshold,
-               abs(capsuleTopY - insideTopY) <= snapThreshold {
-                let placement = DisplayPlacement(anchor: .menuBarInsideCenter, offsetX: 0.0, offsetY: 0.0)
+        // 1. Hardware Notch (or primary home) bottom-center pocket: snaps both X and Y right under the Notch.
+        if let notch {
+            if abs(clampedCenterX - notch.midX) <= snapThreshold,
+               abs(capsuleTopY - belowStatusBarTopY) <= snapThreshold {
+                let placement = DisplayPlacement(
+                    anchor: .notchOrMenuBarBottomCenter,
+                    offsetX: 0.0,
+                    offsetY: defaultBottomGap
+                )
                 let frame = panelFrame(
-                    capsuleCenterX: screen.frame.midX,
-                    capsuleTopY: insideTopY,
+                    capsuleCenterX: notch.midX,
+                    capsuleTopY: belowStatusBarTopY,
                     capsuleSize: capsuleSize
                 )
-                return (screen, placement, frame.origin, true)
+                return (screen, placement, frame.origin, .notchBottomCenter)
             }
         }
 
-        var finalCenterX = capsuleCenterX
-        var snappedHorizontally = false
-        if abs(capsuleCenterX - screen.frame.midX) <= snapThreshold {
-            finalCenterX = screen.frame.midX
-            snappedHorizontally = true
+        // 2. Status bar INSIDE vertical snap rail (Y snaps to vertical center of status bar; X moves freely!).
+        // On Notch displays, active on both the left and right status bar wings outside the camera cutout.
+        let overlapsHardwareNotch: Bool = {
+            guard let notch else { return false }
+            let halfW = capsuleSize.width / 2.0
+            return (clampedCenterX + halfW) > (notch.minX + 2.0)
+                && (clampedCenterX - halfW) < (notch.maxX - 2.0)
+        }()
+
+        if !overlapsHardwareNotch,
+           (abs(capsuleTopY - insideStatusBarTopY) <= snapThreshold || capsuleTopY >= insideStatusBarTopY) {
+            let placement = DisplayPlacement(
+                anchor: .menuBarInsideCenter,
+                offsetX: Double(round((clampedCenterX - screen.frame.midX) * 2.0) / 2.0),
+                offsetY: 0.0
+            )
+            let frame = panelFrame(
+                capsuleCenterX: clampedCenterX,
+                capsuleTopY: insideStatusBarTopY,
+                capsuleSize: capsuleSize
+            )
+            return (screen, placement, frame.origin, .statusBarInsideVertical)
         }
 
-        let clampedCenterX = min(
-            max(finalCenterX, screen.frame.minX + capsuleSize.width / 2.0 + 4.0),
-            screen.frame.maxX - capsuleSize.width / 2.0 - 4.0
-        )
+        // 3. Status bar BELOW vertical snap rail (Y snaps cleanly right below the status bar; X moves freely!).
+        if abs(capsuleTopY - belowStatusBarTopY) <= snapThreshold {
+            let placement = DisplayPlacement(
+                anchor: .custom,
+                offsetX: Double(round((clampedCenterX - screen.frame.midX) * 2.0) / 2.0),
+                offsetY: Double(round((screen.frame.maxY - belowStatusBarTopY) * 2.0) / 2.0)
+            )
+            let frame = panelFrame(
+                capsuleCenterX: clampedCenterX,
+                capsuleTopY: belowStatusBarTopY,
+                capsuleSize: capsuleSize
+            )
+            return (screen, placement, frame.origin, .statusBarBelowVertical)
+        }
+
+        // 4. Free positioning everywhere else (no horizontal X detents).
+        let maxAllowedTopY = overlapsHardwareNotch ? statusBarBottomY : screen.frame.maxY
         let clampedTopY = min(
             max(capsuleTopY, screen.frame.minY + capsuleSize.height + 4.0),
-            screen.frame.maxY
+            maxAllowedTopY
         )
 
         let placement = DisplayPlacement(
@@ -198,7 +284,7 @@ public enum NotchGeometryResolver {
             capsuleTopY: clampedTopY,
             capsuleSize: capsuleSize
         )
-        return (screen, placement, frame.origin, snappedHorizontally)
+        return (screen, placement, frame.origin, .none)
     }
 
     public static func isDockedFlushToTopBar(
@@ -210,7 +296,7 @@ public enum NotchGeometryResolver {
         case .notchOrMenuBarBottomCenter:
             return placement.offsetY <= 2.0
         case .custom:
-            return placement.offsetY <= 38.0
+            return placement.offsetY >= 20.0 && placement.offsetY <= 36.0
         default:
             return false
         }

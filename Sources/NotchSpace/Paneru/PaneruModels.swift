@@ -63,7 +63,7 @@ public struct SpaceItemModel: Identifiable, Equatable, Sendable {
     public var id: Int { number }
     public let number: Int
     public var isActive: Bool
-    public let windows: [SpaceWindowIconItem]
+    public var windows: [SpaceWindowIconItem]
 
     public var isEmpty: Bool { windows.isEmpty }
 }

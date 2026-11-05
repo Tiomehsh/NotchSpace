@@ -3,8 +3,10 @@ import Foundation
 
 public enum SpaceAction: Sendable {
     case focusWorkspace(Int)
+    case focusWindow(Int)
     case sendFocusedWindow(Int)
     case moveAndFollowWindow(Int)
+    case moveSpecificWindow(windowID: Int, fromSpace: Int, toSpace: Int, follow: Bool)
     case stepRelative(north: Bool)
 }
 
@@ -66,24 +68,65 @@ public final class PaneruClient {
     }
 
     public func perform(_ action: SpaceAction) {
-        let args: [String]
+        let execPath = paneruExecutablePath
+
         switch action {
+        case .focusWindow(let winID):
+            Task.detached(priority: .userInitiated) { [weak self] in
+                _ = PaneruMachIPC.focusWindow(windowID: winID)
+                await self?.scheduleDebouncedRefresh(delayMs: 35)
+            }
+            return
+
+        case .moveSpecificWindow(let winID, let fromSpace, let toSpace, let follow):
+            guard fromSpace != toSpace else { return }
+            optimisticallyMoveWindow(windowID: winID, fromSpace: fromSpace, toSpace: toSpace, follow: follow)
+            Task.detached(priority: .userInitiated) { [weak self] in
+                let ok = PaneruMachIPC.moveWindowToWorkspace(
+                    windowID: winID,
+                    workspaceNumber: toSpace,
+                    follow: follow
+                )
+                if !ok {
+                    let subcmd = follow ? "virtualmovenum" : "virtualsendnum"
+                    _ = Self.runCommandSync(
+                        executable: execPath,
+                        arguments: ["send-cmd", "window", subcmd, String(toSpace)]
+                    )
+                }
+                await self?.scheduleDebouncedRefresh(delayMs: 45)
+            }
+            return
+
         case .focusWorkspace(let num):
             optimisticallyHighlight(workspaceNumber: num)
-            args = ["send-cmd", "window", "virtualnum", String(num)]
+            let args = ["send-cmd", "window", "virtualnum", String(num)]
+            Task.detached(priority: .userInitiated) { [weak self] in
+                _ = Self.runCommandSync(executable: execPath, arguments: args)
+                await self?.scheduleDebouncedRefresh(delayMs: 35)
+            }
+
         case .sendFocusedWindow(let num):
-            args = ["send-cmd", "window", "virtualsendnum", String(num)]
+            let args = ["send-cmd", "window", "virtualsendnum", String(num)]
+            Task.detached(priority: .userInitiated) { [weak self] in
+                _ = Self.runCommandSync(executable: execPath, arguments: args)
+                await self?.scheduleDebouncedRefresh(delayMs: 35)
+            }
+
         case .moveAndFollowWindow(let num):
             optimisticallyHighlight(workspaceNumber: num)
-            args = ["send-cmd", "window", "virtualmovenum", String(num)]
-        case .stepRelative(let north):
-            args = ["send-cmd", "window", "virtualfocus", north ? "north" : "south"]
-        }
+            let args = ["send-cmd", "window", "virtualmovenum", String(num)]
+            Task.detached(priority: .userInitiated) { [weak self] in
+                _ = Self.runCommandSync(executable: execPath, arguments: args)
+                await self?.scheduleDebouncedRefresh(delayMs: 35)
+            }
 
-        let execPath = paneruExecutablePath
-        Task.detached(priority: .userInitiated) { [weak self] in
-            _ = Self.runCommandSync(executable: execPath, arguments: args)
-            await self?.scheduleDebouncedRefresh(delayMs: 35)
+        case .stepRelative(let north):
+            let args = ["send-cmd", "window", "virtualfocus", north ? "north" : "south"]
+            Task.detached(priority: .userInitiated) { [weak self] in
+                _ = Self.runCommandSync(executable: execPath, arguments: args)
+                await self?.scheduleDebouncedRefresh(delayMs: 35)
+            }
         }
     }
 
@@ -117,6 +160,36 @@ public final class PaneruClient {
         guard spaces.contains(where: { $0.number == workspaceNumber }) else { return }
         for idx in spaces.indices {
             spaces[idx].isActive = (spaces[idx].number == workspaceNumber)
+        }
+    }
+
+    private func optimisticallyMoveWindow(
+        windowID: Int,
+        fromSpace: Int,
+        toSpace: Int,
+        follow: Bool
+    ) {
+        guard let srcIdx = spaces.firstIndex(where: { $0.number == fromSpace }),
+              let winPos = spaces[srcIdx].windows.firstIndex(where: { $0.windowID == windowID }) else {
+            return
+        }
+
+        let movedItem = spaces[srcIdx].windows.remove(at: winPos)
+
+        if let dstIdx = spaces.firstIndex(where: { $0.number == toSpace }) {
+            spaces[dstIdx].windows.append(movedItem)
+        } else {
+            let newSpace = SpaceItemModel(
+                number: toSpace,
+                isActive: follow,
+                windows: [movedItem]
+            )
+            spaces.append(newSpace)
+            spaces.sort { $0.number < $1.number }
+        }
+
+        if follow {
+            optimisticallyHighlight(workspaceNumber: toSpace)
         }
     }
 

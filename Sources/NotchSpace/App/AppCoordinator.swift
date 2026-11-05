@@ -2,9 +2,9 @@ import AppKit
 import SwiftUI
 
 @MainActor
-public final class AppCoordinator: NSObject {
+public final class AppCoordinator: NSObject, NSMenuDelegate {
     public let configStore = ConfigStore()
-    public let paneruClient = PaneruClient()
+    public let wmClient = WorkspaceManagerClient()
     public let panel = FloatingGlassPanel()
 
     private var hostingView: NSHostingView<SpaceBarView>?
@@ -21,8 +21,9 @@ public final class AppCoordinator: NSObject {
     }
 
     public func start() {
-        paneruClient.setHideEmptyWorkspaces(configStore.config.appearance.hideEmptyWorkspaces)
-        paneruClient.start()
+        wmClient.setMode(configStore.config.interaction.backend)
+        wmClient.setHideEmptyWorkspaces(configStore.config.appearance.hideEmptyWorkspaces)
+        wmClient.start()
 
         setupAppearanceProbe()
         setupPanel()
@@ -32,7 +33,8 @@ public final class AppCoordinator: NSObject {
 
         configStore.onChange = { [weak self] cfg in
             guard let self else { return }
-            self.paneruClient.setHideEmptyWorkspaces(cfg.appearance.hideEmptyWorkspaces)
+            self.wmClient.setMode(cfg.interaction.backend)
+            self.wmClient.setHideEmptyWorkspaces(cfg.appearance.hideEmptyWorkspaces)
             self.syncPanelFlags()
             self.refreshRootViewAndLayout()
             self.updateMenuBarStatusItem()
@@ -41,7 +43,7 @@ public final class AppCoordinator: NSObject {
     }
 
     private func resolveTargetScreen() -> NSScreen {
-        if let activeDisplayID = paneruClient.lastRawDocument?.active.display_id,
+        if let activeDisplayID = wmClient.activeDisplayID,
            let matched = NSScreen.screens.first(where: { NotchGeometryResolver.displayID(for: $0) == activeDisplayID }) {
             return matched
         }
@@ -58,7 +60,7 @@ public final class AppCoordinator: NSObject {
         syncPanelFlags()
 
         panel.onSpaceAction = { [weak self] action in
-            self?.paneruClient.perform(action)
+            self?.wmClient.perform(action)
         }
 
         panel.onContextMenuRequest = { [weak self] event, view in
@@ -90,7 +92,7 @@ public final class AppCoordinator: NSObject {
 
         let container = HoverTrackingContainerView(frame: .zero)
         container.onHoverPointChanged = { [weak self] pt in
-            self?.panel.bridge.hoverLocationInRoot = pt
+            self?.panel.updateHoverLocation(pt)
         }
         container.addSubview(hosting)
         NSLayoutConstraint.activate([
@@ -168,7 +170,7 @@ public final class AppCoordinator: NSObject {
         let scheme = resolveColorScheme(for: screen, placement: placement)
         panel.appearance = NSAppearance(named: scheme == .dark ? .darkAqua : .aqua)
         return SpaceBarView(
-            paneruClient: paneruClient,
+            wmClient: wmClient,
             configStore: configStore,
             bridge: panel.bridge,
             isDockedChinMode: isChin,
@@ -193,7 +195,7 @@ public final class AppCoordinator: NSObject {
         let screen = resolveTargetScreen()
         currentScreen = screen
         updateHostingRootView(for: screen, placementOverride: previewPlacementOverride)
-        if !panel.bridge.isDraggingWindow {
+        if !panel.bridge.isDraggingWindow && panel.bridge.activeAppDrag == nil {
             repositionPanel(on: screen)
         }
     }
@@ -202,7 +204,7 @@ public final class AppCoordinator: NSObject {
         let cfg = configStore.config.appearance
         let scale = CGFloat(min(max(cfg.scale, 0.80), 1.40))
         let metrics = SpaceBarView.computeRestingMetrics(
-            spaces: paneruClient.spaces,
+            spaces: wmClient.spaces,
             iconStyle: cfg.iconStyle,
             scale: scale
         )
@@ -234,14 +236,16 @@ public final class AppCoordinator: NSObject {
 
     private func observeCapsuleSizeChanges() {
         withObservationTracking {
-            _ = paneruClient.spaces
+            _ = wmClient.spaces
             _ = configStore.config.appearance
-            _ = paneruClient.lastRawDocument?.active.display_id
+            _ = wmClient.activeDisplayID
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 try? await Task.sleep(for: .milliseconds(16))
-                if !self.panel.bridge.isDraggingWindow, !NSScreen.screens.isEmpty {
+                if !self.panel.bridge.isDraggingWindow,
+                   self.panel.bridge.activeAppDrag == nil,
+                   !NSScreen.screens.isEmpty {
                     let screen = self.resolveTargetScreen()
                     self.currentScreen = screen
                     self.updateHostingRootView(for: screen, placementOverride: self.previewPlacementOverride)
@@ -271,7 +275,7 @@ public final class AppCoordinator: NSObject {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.paneruClient.scheduleDebouncedRefresh(delayMs: 40)
+                self.wmClient.scheduleDebouncedRefresh(delayMs: 40)
                 self.updateFullscreenVisibility()
             }
         }
@@ -283,7 +287,7 @@ public final class AppCoordinator: NSObject {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                Task { await self.paneruClient.refreshNow() }
+                Task { await self.wmClient.refreshNow() }
                 self.refreshRootViewAndLayout()
             }
         }
@@ -347,8 +351,19 @@ public final class AppCoordinator: NSObject {
         }
     }
 
+    public func menuNeedsUpdate(_ menu: NSMenu) {
+        populateQuickMenu(menu)
+    }
+
     private func buildQuickMenu() -> NSMenu {
         let menu = NSMenu(title: "NotchSpace")
+        menu.delegate = self
+        populateQuickMenu(menu)
+        return menu
+    }
+
+    private func populateQuickMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
 
         let resetItem = NSMenuItem(
             title: "归位至刘海 / 菜单栏正下方",
@@ -464,9 +479,31 @@ public final class AppCoordinator: NSObject {
         prefsItem.target = self
         menu.addItem(prefsItem)
 
+        // WM Backend Submenu
+        let wmSub = NSMenu()
+        for mode in WMBackendMode.allCases {
+            let subItem = NSMenuItem(
+                title: mode.displayName,
+                action: #selector(selectWMBackend(_:)),
+                keyEquivalent: ""
+            )
+            subItem.target = self
+            subItem.representedObject = mode.rawValue
+            subItem.state = configStore.config.interaction.backend == mode ? .on : .off
+            wmSub.addItem(subItem)
+        }
+        let statusSuffix = wmClient.isConnected ? "已连接" : "未连接"
+        let wmRoot = NSMenuItem(
+            title: "窗口后端：\(wmClient.activeBackendName)（\(statusSuffix)）",
+            action: nil,
+            keyEquivalent: ""
+        )
+        wmRoot.submenu = wmSub
+        menu.addItem(wmRoot)
+
         let reloadItem = NSMenuItem(
-            title: "刷新 Paneru 状态",
-            action: #selector(forceRefreshPaneru),
+            title: "刷新 \(wmClient.activeBackendName) 状态",
+            action: #selector(forceRefreshWM),
             keyEquivalent: ""
         )
         reloadItem.target = self
@@ -481,8 +518,6 @@ public final class AppCoordinator: NSObject {
         )
         quitItem.target = self
         menu.addItem(quitItem)
-
-        return menu
     }
 
     @objc private func resetCurrentDisplayPosition() {
@@ -545,12 +580,18 @@ public final class AppCoordinator: NSObject {
         settingsController?.present()
     }
 
-    @objc private func forceRefreshPaneru() {
-        Task { await paneruClient.refreshNow() }
+    @objc private func selectWMBackend(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let mode = WMBackendMode(rawValue: raw) else { return }
+        configStore.update { $0.interaction.backend = mode }
+    }
+
+    @objc private func forceRefreshWM() {
+        Task { await wmClient.refreshNow() }
     }
 
     @objc private func quitApp() {
-        paneruClient.stop()
+        wmClient.stop()
         NSApp.terminate(nil)
     }
 }

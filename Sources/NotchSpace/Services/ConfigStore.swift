@@ -96,7 +96,22 @@ public struct AppearanceConfig: Codable, Equatable, Sendable {
     }
 }
 
+public enum WMBackendMode: String, Codable, CaseIterable, Sendable {
+    case auto
+    case omniwm
+    case paneru
+
+    public var displayName: String {
+        switch self {
+        case .auto: "自动识别 (优先 OmniWM · 兼容 Paneru)"
+        case .omniwm: "固定 OmniWM"
+        case .paneru: "固定 Paneru"
+        }
+    }
+}
+
 public struct InteractionConfig: Codable, Equatable, Sendable {
+    public var backend: WMBackendMode = .auto
     public var lockPosition: Bool = false
     public var enableScrollSwitch: Bool = false
     public var hideInFullscreen: Bool = false
@@ -104,6 +119,16 @@ public struct InteractionConfig: Codable, Equatable, Sendable {
     public var snapThreshold: Double = 8.0
 
     public init() {}
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.backend = try c.decodeIfPresent(WMBackendMode.self, forKey: .backend) ?? .auto
+        self.lockPosition = try c.decodeIfPresent(Bool.self, forKey: .lockPosition) ?? false
+        self.enableScrollSwitch = try c.decodeIfPresent(Bool.self, forKey: .enableScrollSwitch) ?? false
+        self.hideInFullscreen = try c.decodeIfPresent(Bool.self, forKey: .hideInFullscreen) ?? false
+        self.showMenuBarIcon = try c.decodeIfPresent(Bool.self, forKey: .showMenuBarIcon) ?? true
+        self.snapThreshold = try c.decodeIfPresent(Double.self, forKey: .snapThreshold) ?? 8.0
+    }
 }
 
 public struct DisplayPlacement: Codable, Equatable, Sendable {

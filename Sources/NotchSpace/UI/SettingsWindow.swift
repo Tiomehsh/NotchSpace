@@ -11,7 +11,7 @@ public final class SettingsWindowController: NSWindowController {
         self.activeScreenProvider = activeScreenProvider
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 560),
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 590),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -237,6 +237,18 @@ private struct SettingsContentView: View {
             }
 
             Section("交互与系统集成") {
+                Picker(
+                    "窗口管理器后端",
+                    selection: Binding(
+                        get: { configStore.config.interaction.backend },
+                        set: { val in configStore.update { $0.interaction.backend = val } }
+                    )
+                ) {
+                    ForEach(WMBackendMode.allCases, id: \.self) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+
                 Toggle(
                     "支持在胶囊上滚动鼠标滚轮切换上下工作区",
                     isOn: Binding(
@@ -277,13 +289,13 @@ private struct SettingsContentView: View {
                         NSWorkspace.shared.activateFileViewerSelecting([configStore.configFileURL])
                     }
                     Spacer()
-                    Text("左键切换 · 右键移窗留人 · ⇧左键携窗跳转")
+                    Text("左右就近把手移窗 · 拖图标跨工作区 · ⇧ 拖放携窗跟随")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
             }
         }
         .formStyle(.grouped)
-        .frame(width: 480, height: 560)
+        .frame(width: 480, height: 590)
     }
 }
